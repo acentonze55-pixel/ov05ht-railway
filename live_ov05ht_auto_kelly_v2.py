@@ -28,6 +28,11 @@ import requests
 import pandas as pd
 from dotenv import load_dotenv
 
+# === LOG AVVIO (per Railway/Deploy Logs) ===
+import datetime as _dt
+print(f"[INFO] Avvio script alle {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("[INFO] Monitor LIVE OV 0.5 HT avviato (Railway) — in attesa di partite live...")
+
 API_HOST = "https://v3.football.api-sports.io"
 
 # ---------------- Telegram ----------------
@@ -38,8 +43,8 @@ def tg_send(token: str, chat_id: str, text: str) -> None:
             json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
             timeout=15,
         ).raise_for_status()
-    except Exception:
-        pass
+    except Exception as e:
+        print("[TG] Invio Telegram fallito:", repr(e))
 
 # ---------------- API-Football helpers ----------------
 def api_get(path: str, headers: Dict[str, str], params: Dict[str, Any]) -> Dict[str, Any]:
@@ -216,21 +221,26 @@ def run(
         )
 
     tg_send(tg_token, tg_chat, f"Monitor LIVE OV0.5 HT (picker-logic) avviato — soglia {threshold:.2f}, pthresh {pthresh:.2f}, min_played {min_played}, Kelly x{kelly_mult}, bankroll {bankroll:.2f}")
+    print(f"[STARTUP] Telegram ping di avvio inviato. Bankroll {bankroll:.2f}, soglia {threshold}, pthresh {pthresh}, min_played {min_played}")
 
+    # Heartbeat counter
+    _hb_i = 0
     try:
         while True:
-            # 1) live fixtures
             try:
                 fx_list = fixtures_live(headers)
             except requests.HTTPError as e:
                 code = e.response.status_code if e.response is not None else None
                 if code == 429:
+                    print("[WARN] Rate limit (429) su /fixtures live — retry fra 2s")
                     time.sleep(2.0); continue
+                print("[WARN] HTTP error su /fixtures live — retry fra 0.5s")
                 time.sleep(0.5); continue
-            except requests.RequestException:
+            except requests.RequestException as e:
+                print("[WARN] Network error su /fixtures live:", repr(e))
                 time.sleep(0.5); continue
 
-            # 2) filtra per 1° tempo e per leghe (opzionale)
+            # filtra per 1° tempo e per leghe (opzionale)
             fx_1h: List[Dict[str, Any]] = []
             for fx in fx_list:
                 st, el = status_elapsed(fx)
@@ -244,7 +254,7 @@ def run(
                     continue
                 fx_1h.append(fx)
 
-            # 3) per ciascun match, applica GATE picker e poi controlla odds live
+            # per ciascun match, applica GATE picker e poi controlla odds live
             for fx in fx_1h:
                 fid = int(fx.get("fixture", {}).get("id"))
                 lg_id = int(fx.get("league", {}).get("id", 0) or 0)
@@ -260,7 +270,6 @@ def run(
 
                 # ---- calcolo/lookup p_over05_ht con logica picker ----
                 if key_match not in p_cache:
-                    # prendi team stats (cache per ridurre chiamate)
                     def get_team_stats_cached(team_id: int) -> Dict[str, Any]:
                         tkey = (lg_id, season, team_id)
                         if tkey not in team_stats_cache:
@@ -364,11 +373,12 @@ def run(
                     f"Stake (Kelly x{kelly_mult:.2f}): {stake:.2f}  —  Bankroll: {bankroll:.2f}\n"
                     "\nBook (top):\n" + top_txt
                 )
+                print(f"[ALERT] {lg_name} | {home_name} vs {away_name} | {el}' | {best_odd:.2f} @ {best_book} | stake {stake:.2f} | p={p_used:.2f}")
                 tg_send(tg_token, tg_chat, msg)
 
                 time.sleep(0.05)
 
-            # 4) settlement giocate aperte
+            # settlement giocate aperte
             to_close: List[str] = []
             for key, bet in list(open_bets.items()):
                 fid = int(bet["fixture_id"])
@@ -401,6 +411,7 @@ def run(
                             f"Stake {stake:.2f} @ {odds:.2f} — ingresso {placed_min}'\n"
                             f"Nuovo bankroll: {bankroll:.2f}"
                         )
+                        print(f"[SETTLED] {result} | {lg} | {match} | stake {stake:.2f} @ {odds:.2f} | new bankroll {bankroll:.2f}")
                         to_close.append(key)
                         time.sleep(0.05)
 
@@ -409,10 +420,13 @@ def run(
                     if code == 429:
                         time.sleep(2.0)
                     else:
+                        print("[WARN] HTTP error su settlement:", code)
                         time.sleep(0.3)
-                except requests.RequestException:
+                except requests.RequestException as e:
+                    print("[WARN] Network error su settlement:", repr(e))
                     time.sleep(0.3)
-                except Exception:
+                except Exception as e:
+                    print("[WARN] Generic error su settlement:", repr(e))
                     time.sleep(0.2)
 
             for key in to_close:
@@ -421,11 +435,18 @@ def run(
                 state["open_bets"] = open_bets
                 save_state(state_file, state)
 
+            # --- HEARTBEAT nei log ---
+            _hb_i += 1
+            # stampa ~ogni 60 secondi (adatta in base al poll_seconds)
+            if _hb_i % max(1, int(60 / max(1e-9, poll_seconds))) == 0:
+                print(f"[HB] {len(fx_1h)} match in 1H — open_bets={len(open_bets)} — {_dt.datetime.now().strftime('%H:%M:%S')}")
+
             time.sleep(poll_seconds)
 
     except KeyboardInterrupt:
         save_state(state_file, {"bankroll": bankroll, "open_bets": open_bets})
         tg_send(tg_token, tg_chat, "Monitor interrotto manualmente.")
+        print("[INFO] Interrotto manualmente: stato salvato.")
 
 # ---------------- CLI ----------------
 def main():
