@@ -1,267 +1,343 @@
 # -*- coding: utf-8 -*-
 """
-live_ov05ht_auto_kelly_v2.py
-Monitor live per Over 0.5 Primo Tempo con alert Telegram.
-Patch: BYPASS_PREFILTER, ricerca robusta mercato HT O0.5, counters diagnostici.
-
-Requisiti (requirements.txt):
-    requests
-    python-dotenv
-
-Procfile:
-    worker: python live_ov05ht_auto_kelly_v2.py
+Monitor HT Over 0.5 (LIVE) + Kelly, ristretto ai soli fixture_id della WHITELIST.
+La whitelist può arrivare da:
+- WHITELIST_URL  (JSON array oppure CSV con colonna 'fixture_id')
+- WHITELIST      (lista di ID separati da virgola)
+Se REQUIRE_WHITELIST=1 e la whitelist è vuota, non invia alert.
 """
 
 import os
-import sys
 import time
-import math
 import json
+import math
+import csv
+import io
 import traceback
-from typing import Dict, Any, List, Optional, Tuple
-
+from datetime import datetime
 import requests
 
-# ------------------------ ENV ------------------------
 API_HOST = "https://v3.football.api-sports.io"
+API_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
+HEADERS = {"x-apisports-key": API_KEY}
 
-API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "").strip()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# Parametri operativi
-POLL_SECONDS   = int(os.getenv("POLL_SECONDS", "12") or 12)     # polling live
-THRESHOLD      = float(os.getenv("THRESHOLD", "1.50") or 1.50)  # soglia quota HT O0.5
-PTHRESH        = float(os.getenv("PTHRESH", "0.70") or 0.70)    # usato dal prefilter (se attivo)
-MIN_PLAYED     = int(os.getenv("MIN_PLAYED", "6") or 6)         # usato dal prefilter (se attivo)
-NO_FORM        = int(os.getenv("NO_FORM", "0") or 0)            # se 1, ignora filtro forma
-DEBUG          = int(os.getenv("DEBUG", "0") or 0)              # log verboso
-BYPASS_PREFILTER = int(os.getenv("BYPASS_PREFILTER", "0") or 0) # se 1, salta completamente il picker
+DEBUG = int(os.getenv("DEBUG", "0") or 0)
 
-# Book vincolanti (se stringa vuota = usa qualunque)
-ONLY_BOOKS_RAW = os.getenv("ONLY_BOOKS", "")
-ONLY_BOOKS_SET = {b.strip() for b in ONLY_BOOKS_RAW.split(",") if b.strip()} or None
+THRESHOLD     = float(os.getenv("THRESHOLD", "1.50") or 1.50)
+POLL_SECONDS  = int(os.getenv("POLL_SECONDS", "12") or 12)
+PTHRESH       = float(os.getenv("PTHRESH", "0.72") or 0.72)
 
-# Kelly (conservativo)
-KELLY_FACTOR   = float(os.getenv("KELLY_FACTOR", "0.25") or 0.25)  # frazione Kelly
-BANKROLL       = float(os.getenv("BANKROLL", "1000") or 1000.0)    # bankroll virtuale per suggerire stake
+KELLY_SCALE   = float(os.getenv("KELLY_SCALE", "0.5") or 0.5)
+BANKROLL_FILE = os.getenv("BANKROLL_FILE", "/app/bankroll.json")
+BANKROLL_START= float(os.getenv("BANKROLL_START", "100.0") or 100.0)
+MAX_STAKE_PCT = float(os.getenv("MAX_STAKE_PCT", "0.05") or 0.05)
+MIN_STAKE     = float(os.getenv("MIN_STAKE", "1.0") or 1.0)
 
-# -------------------- HTTP helpers --------------------
-HEADERS = {"x-apisports-key": API_FOOTBALL_KEY}
+MINUTE_MIN    = int(os.getenv("MINUTE_MIN", "1") or 1)
+MINUTE_MAX    = int(os.getenv("MINUTE_MAX", "45") or 45)
 
-def api_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{API_HOST}{path}"
-    r = requests.get(url, headers=HEADERS, params=params, timeout=30)
+# --- Whitelist settings ---
+WHITELIST_URL       = os.getenv("WHITELIST_URL", "").strip()
+WHITELIST_INLINE    = os.getenv("WHITELIST", "").strip()  # "123,456,789"
+REQUIRE_WHITELIST   = int(os.getenv("REQUIRE_WHITELIST", "1") or 1)
+WHITELIST_REFRESH_S = int(os.getenv("WHITELIST_REFRESH_S", "300") or 300)  # 5 minuti
+
+
+def log(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
+def tg_send(text: str):
+    if not BOT_TOKEN or not CHAT_ID:
+        log("[TELEGRAM] BOT_TOKEN o CHAT_ID mancanti")
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": CHAT_ID, "text": text}, timeout=20)
+    except Exception as e:
+        log(f"[TELEGRAM] errore invio: {e}")
+
+
+def _api_get(path: str, params: dict):
+    r = requests.get(f"{API_HOST}{path}", headers=HEADERS, params=params, timeout=20)
     r.raise_for_status()
-    return r.json()
+    return r.json().get("response", [])
 
-def get_live_fixtures() -> List[Dict[str, Any]]:
-    # Tutte le partite live
-    data = api_get("/fixtures", {"live": "all"})
-    return data.get("response", [])
 
-def get_odds_for_fixture(fixture_id: int) -> List[Dict[str, Any]]:
-    # Odds (pre + event. live dove disponibile)
-    data = api_get("/odds", {"fixture": fixture_id})
-    return data.get("response", [])
+def fetch_odds_any(fixture_id: int, debug=False):
+    try:
+        live = _api_get("/odds/live", {"fixture": fixture_id})
+        if debug: log(f"[ODDS] live items={len(live)} for {fixture_id}")
+        if live:
+            return live
+    except Exception as e:
+        if debug: log(f"[ODDS] live error: {e}")
+    try:
+        pre = _api_get("/odds", {"fixture": fixture_id})
+        if debug: log(f"[ODDS] prematch items={len(pre)} for {fixture_id}")
+        return pre
+    except Exception as e:
+        if debug: log(f"[ODDS] prematch error: {e}")
+        return []
 
-# ----------------- Odds market picker -----------------
-def pick_ht_over05_price(odds_resp: list, only_books: Optional[set]) -> Optional[Tuple[str, float]]:
-    """
-    Trova (book_name, price) per Over 0.5 1st Half, scorrendo più varianti di mercato
-    che API-Football può usare.
-    Ritorna la miglior quota fra i book ammessi (o tutti, se only_books=None).
-    """
+
+def pick_ht_over05_price(odds_resp, debug=False):
     MARKET_NAMES = {
         "1st Half - Over/Under",
         "Over/Under 1st Half",
-        "Goals Over/Under - 1st Half",
+        "Over/Under (1st Half)",
+        "Goals Over/Under 1st Half",
         "1st Half Goals Over/Under",
-        "First Half Goals Over/Under",
-        "First Half - Total Goals",
         "1st Half Total Goals",
+        "1st Half Goals",
+        "First Half - Over/Under",
+        "Over/Under First Half",
+        "1st Half - Total Goals",
+        "1st Half Goal Line",
     }
+    VALUE_NAMES = {"Over 0.5", "Over0.5", "Over 0.5 Goals"}
 
-    best = None  # (book_name, price)
-    for item in odds_resp:
+    best = None
+    best_book = None
+    seen_markets = set()
+
+    for item in odds_resp or []:
         for book in item.get("bookmakers", []):
-            bname = str(book.get("name") or "").strip()
-            if only_books and bname not in only_books:
-                continue
-            for market in book.get("bets", []):
-                mname = str(market.get("name") or "").strip()
-                if mname not in MARKET_NAMES:
+            bname = book.get("name", "")
+            for bet in book.get("bets", []):
+                mk = (bet.get("name") or "").strip()
+                seen_markets.add(mk)
+                if mk not in MARKET_NAMES:
                     continue
-                for val in market.get("values", []):
-                    vname = str(val.get("value") or "").strip()
-                    # Varianti: "Over 0.5", "Over 0.5 (HT)", ecc.
-                    if not vname.lower().startswith("over 0.5"):
+                for v in bet.get("values", []):
+                    val = (v.get("value") or "").strip()
+                    if not any(val.startswith(x) for x in VALUE_NAMES):
                         continue
-                    odd = val.get("odd")
                     try:
-                        price = float(odd)
+                        price = float(v.get("odd"))
                     except Exception:
                         continue
-                    if (best is None) or (price > best[1]):
-                        best = (bname, price)
-    return best
+                    if (best is None) or (price > best):
+                        best = price
+                        best_book = bname
 
-# ------------------ Prefilter (picker) ----------------
-def prefilter_fixture(f: Dict[str, Any]) -> bool:
-    """
-    Qui ci andrebbe la logica del "picker" (metodo che seleziona i match con pHT alto).
-    Per ora:
-      - se BYPASS_PREFILTER=1 => True
-      - se NO_FORM=1 => True
-      - altrimenti True (placeholder)
-    Così possiamo testare a pieno la catena live-odds.
-    """
-    if BYPASS_PREFILTER:
-        return True
-    if NO_FORM:
-        return True
+    if debug and best is None:
+        markets_sorted = ", ".join(sorted(seen_markets))
+        log(f"[NO-ODDS] nessuna HT O0.5 — mercati visti: {markets_sorted}")
 
-    # TODO: inserire i tuoi criteri reali (es. pHT stimata >= PTHRESH, MIN_PLAYED, ecc.)
-    # Per ora non scartiamo nulla:
-    return True
+    return best, best_book
 
-# ---------------------- Telegram ----------------------
-def tg_send(text: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[WARN] Telegram non configurato (TOKEN/CHAT_ID mancanti)")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+
+def load_bankroll():
     try:
-        r = requests.post(url, data=payload, timeout=15)
-        if r.status_code != 200:
-            print(f"[TG] HTTP {r.status_code} -> {r.text}")
+        with open(BANKROLL_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"bankroll": BANKROLL_START, "pending": {}, "history": []}
+
+
+def save_bankroll(data):
+    try:
+        with open(BANKROLL_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"[TG] errore: {e}")
+        log(f"[BANKROLL] save error: {e}")
 
-# -------------------- Kelly (conservativo) ------------
-def kelly_stake(bankroll: float, price: float, p_est: float, kfactor: float = 0.25) -> float:
-    """
-    Kelly frazionario: f* = [(p * (odds-1)) - (1-p)] / (odds-1)
-    Usiamo una p_est conservativa = max(1/odds + piccolo margine, 0).
-    Se edge <= 0 => stake 0.
-    """
-    b = price - 1.0
-    edge = (p_est * b) - (1 - p_est)
-    if b <= 0 or edge <= 0:
+
+def kelly_fraction(p: float, odds: float) -> float:
+    b = max(0.0, odds - 1.0)
+    if b <= 0:
         return 0.0
-    f_star = edge / b
-    return max(0.0, kfactor * f_star * bankroll)
+    q = 1.0 - p
+    f = (b * p - q) / b
+    return max(0.0, f)
 
-def conservative_p_est(price: float) -> float:
-    # Senza modello: prendiamo la probabilità implicita del mercato e aggiungiamo
-    # un micro-edge di test (qui zero). Puoi spingere +0.02 se vuoi “aprire” qualche pick.
-    base = 1.0 / max(1e-9, price)
-    p = base  # + 0.00
-    return min(0.99, max(0.01, p))
 
-# ----------------------- Main loop --------------------
+def suggest_stake(bankroll: float, p_est: float, odds: float) -> float:
+    f_full = kelly_fraction(p_est, odds)
+    f_scaled = f_full * KELLY_SCALE
+    max_cap = bankroll * MAX_STAKE_PCT
+    stake = bankroll * f_scaled
+    stake = min(max_cap, stake)
+    stake = max(0.0, stake)
+    if stake < MIN_STAKE:
+        return 0.0
+    return round(stake, 2)
+
+
+def estimate_p_ht_over05(_fixture) -> float:
+    return PTHRESH
+
+
+def get_live_fixtures():
+    try:
+        resp = _api_get("/fixtures", {"live": "all"})
+    except Exception as e:
+        if DEBUG: log(f"[LIVE] error: {e}")
+        return []
+    out = []
+    for item in resp:
+        fx = item.get("fixture", {})
+        st = fx.get("status", {}) or {}
+        short = st.get("short", "")
+        elapsed = st.get("elapsed", 0) or 0
+        if short != "1H":
+            continue
+        if not (MINUTE_MIN <= int(elapsed) <= MINUTE_MAX):
+            continue
+        out.append(item)
+    return out
+
+
+# ---------- WHITELIST ----------
+_last_wl_load = 0
+_whitelist_ids = set()
+
+def parse_ids_from_inline(text: str):
+    out = set()
+    for tok in text.replace(" ", "").split(","):
+        if tok.isdigit():
+            out.add(int(tok))
+    return out
+
+def load_whitelist(force=False):
+    global _last_wl_load, _whitelist_ids
+    now = time.time()
+    if not force and (now - _last_wl_load < WHITELIST_REFRESH_S):
+        return _whitelist_ids
+    ids = set()
+
+    # 1) URL
+    if WHITELIST_URL:
+        try:
+            r = requests.get(WHITELIST_URL, timeout=20)
+            r.raise_for_status()
+            ct = (r.headers.get("Content-Type") or "").lower()
+            if "json" in ct or r.text.strip().startswith("["):
+                data = r.json()
+                for x in data:
+                    try:
+                        ids.add(int(x))
+                    except: pass
+            else:
+                # prova CSV
+                f = io.StringIO(r.text)
+                rd = csv.DictReader(f)
+                if "fixture_id" in (rd.fieldnames or []):
+                    for row in rd:
+                        try:
+                            ids.add(int(row.get("fixture_id")))
+                        except: pass
+        except Exception as e:
+            log(f"[WHITELIST] URL error: {e}")
+
+    # 2) INLINE (env)
+    if WHITELIST_INLINE:
+        ids |= parse_ids_from_inline(WHITELIST_INLINE)
+
+    _whitelist_ids = ids
+    _last_wl_load = now
+    if DEBUG:
+        log(f"[WHITELIST] loaded {len(ids)} ids")
+    return _whitelist_ids
+
+
 def main():
-    if not API_FOOTBALL_KEY:
-        print("⚠️  API_FOOTBALL_KEY mancante")
-        sys.exit(1)
+    if not API_KEY:
+        log("⚠️ API_FOOTBALL_KEY mancante")
+        return
 
-    open_bets = set()  # fixture_id già notificati (evita duplicati nella stessa fase)
-    print("[INIT] live monitor avviato "
-          f"(THRESHOLD={THRESHOLD}, POLL={POLL_SECONDS}s, BYPASS_PREFILTER={BYPASS_PREFILTER}, "
-          f"ONLY_BOOKS={','.join(ONLY_BOOKS_SET or []) or 'ANY'})")
+    data = load_bankroll()
+    notified = set()
+
+    log(f"Avvio monitor (whitelist-mode). THRESH={THRESHOLD} P~{PTHRESH} Kelly={KELLY_SCALE} BR={data['bankroll']:.2f}")
 
     while True:
         try:
-            fixtures = get_live_fixtures()
-        except Exception as e:
-            print(f"[ERR] get_live_fixtures: {e}")
+            wl = load_whitelist()
+            if REQUIRE_WHITELIST and not wl:
+                log("[SAFE] Whitelist vuota → nessun alert (REQUIRE_WHITELIST=1)")
+                time.sleep(POLL_SECONDS)
+                continue
+
+            lives = get_live_fixtures()
+            if DEBUG: log(f"[HB] live_1H={len(lives)} wl={len(wl)}")
+
+            for it in lives:
+                fx = it.get("fixture", {})
+                fid = int(fx.get("id"))
+                if wl and fid not in wl:
+                    # fuori dal tuo metodo → skip
+                    continue
+
+                st = fx.get("status", {}) or {}
+                elapsed = st.get("elapsed", 0) or 0
+
+                league = it.get("league", {}) or {}
+                teams  = it.get("teams", {}) or {}
+                home   = teams.get("home", {}).get("name", "Home")
+                away   = teams.get("away", {}).get("name", "Away")
+                lname  = league.get("name", "League")
+
+                key = f"{fid}_{elapsed}"
+                if key in notified:
+                    continue
+
+                p_est = estimate_p_ht_over05(it)
+
+                odds_resp = fetch_odds_any(fid, debug=DEBUG)
+                price, book = pick_ht_over05_price(odds_resp, debug=DEBUG)
+                if price is None:
+                    if DEBUG: log(f"[NO-ODDS] {fid} nessuna quota HT 0.5")
+                    continue
+
+                if DEBUG:
+                    log(f"[ODDS] {fid} {home}-{away} {lname} m{elapsed}  best={price:.2f}@{book} p~{p_est:.2f}")
+
+                if price >= THRESHOLD:
+                    bankroll = float(data.get("bankroll", BANKROLL_START))
+                    stake = suggest_stake(bankroll, p_est, price)
+
+                    lines = [
+                        f"▶️ OV 0.5 HT @ {price:.2f} ({book})",
+                        f"{home} — {away}",
+                        f"{lname} | min {elapsed}",
+                        f"p≈{p_est:.2f}  bankroll={bankroll:.2f}",
+                    ]
+                    if stake > 0:
+                        lines.append(f"💰 Stake (Kelly {KELLY_SCALE:g}x, cap {int(MAX_STAKE_PCT*100)}%): {stake:.2f}")
+                        data["pending"][str(fid)] = {
+                            "ts": int(time.time()),
+                            "stake": stake,
+                            "odds": price,
+                            "p": p_est,
+                            "home": home,
+                            "away": away,
+                            "league": lname
+                        }
+                        save_bankroll(data)
+                    else:
+                        lines.append("💰 Stake molto piccolo → non suggerito")
+
+                    tg_send("\n".join(lines))
+                    log(f"[ALERT] {fid} {home}-{away} @{price:.2f} ({book}) stake={stake:.2f}")
+                    notified.add(key)
+
             time.sleep(POLL_SECONDS)
-            continue
 
-        # Filtra solo partite nel 1° tempo (o appena HT)
-        live_first_half: List[Dict[str, Any]] = []
-        for f in fixtures:
-            fs = f["fixture"]["status"]["short"]  # '1H', 'HT', '2H', ecc.
-            minute = int(f["fixture"]["status"].get("elapsed") or 0)
-            if fs in {"1H", "HT"} and 0 <= minute <= 46:
-                live_first_half.append(f)
+        except KeyboardInterrupt:
+            log("Stop richiesto.")
+            break
+        except Exception as e:
+            log(f"[ERR] {e}")
+            if DEBUG:
+                traceback.print_exc()
+            time.sleep(3)
 
-        # Counters diagnostici
-        cnt_scanned = 0
-        cnt_pref_ok = 0
-        cnt_with_odds = 0
-        cnt_ge_thr = 0
 
-        for f in live_first_half:
-            cnt_scanned += 1
-
-            # Prefilter (picker)
-            if not prefilter_fixture(f):
-                if DEBUG:
-                    print(f"[SKIP] prefilter KO: {f['teams']['home']['name']} - {f['teams']['away']['name']}")
-                continue
-            cnt_pref_ok += 1
-
-            fid = f["fixture"]["id"]
-            if fid in open_bets:
-                # Già notificato in questa sessione
-                continue
-
-            # Odds
-            try:
-                odds_resp = get_odds_for_fixture(fid)
-            except Exception as e:
-                if DEBUG:
-                    print(f"[NO-ODDS] fixture {fid} errore odds: {e}")
-                continue
-
-            found = pick_ht_over05_price(odds_resp, ONLY_BOOKS_SET)
-            if not found:
-                if DEBUG:
-                    print(f"[NO-ODDS] {fid} nessuna quota HT O0.5 trovata")
-                continue
-
-            book, price = found
-            cnt_with_odds += 1
-
-            if price >= THRESHOLD:
-                cnt_ge_thr += 1
-
-                # Stima p e stake Kelly conservativo
-                p_est = conservative_p_est(price)
-                stake = kelly_stake(BANKROLL, price, p_est, KELLY_FACTOR)
-
-                home = f["teams"]["home"]["name"]
-                away = f["teams"]["away"]["name"]
-                league = f["league"]["name"]
-                minute = int(f["fixture"]["status"].get("elapsed") or 0)
-
-                msg = (
-                    f"⚽️ <b>OV 0.5 HT LIVE</b>\n"
-                    f"{home} – {away}\n"
-                    f"🏆 {league} | ⏱ {minute}'\n"
-                    f"📈 Quota: <b>{price:.2f}</b>  ({book})\n"
-                    f"💡 Kelly {KELLY_FACTOR:.2f}x: stake ≈ <b>{stake:.2f}</b> u "
-                    f"(p≈{p_est:.02f})"
-                )
-                print(f"[PICK] fid={fid} {home}-{away} @ {price:.2f} ({book}) minute={minute}")
-                tg_send(msg)
-
-                open_bets.add(fid)
-
-        # Heartbeat + stats
-        print(f"[HB] 1H={len(live_first_half)} — scanned={cnt_scanned} pre_ok={cnt_pref_ok} "
-              f"with_odds={cnt_with_odds} >=thr={cnt_ge_thr}")
-
-        time.sleep(POLL_SECONDS)
-
-# ------------------------ Run -------------------------
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("Bye!")
-    except Exception:
-        traceback.print_exc()
-        sys.exit(1)
+    main()
