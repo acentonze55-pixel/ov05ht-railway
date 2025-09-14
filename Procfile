@@ -1,4 +1,4 @@
-worker: python live_ov05ht_auto_kelly_v3_whitelist.py
+web: uvicorn app_combo:app --host 0.0.0.0 --port $PORT
 
 
 
