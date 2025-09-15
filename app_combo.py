@@ -3,10 +3,11 @@
 Railway COMBO service:
 - Picker: costruisce una whitelist di fixture_id per oggi (criteri "strict" semplificati)
 - Monitor: osserva SOLO i fixture della whitelist e manda alert Telegram su HT Over 0.5 >= THRESHOLD
-- Web: FastAPI /health /whitelist.json /status
+- Web: FastAPI /health /whitelist.json /status + /selftest + /probe_odds
+- Diagnostica: BYPASS_WHITELIST, DEBUG_ODDS
 
-NOTE: il picker stima p(OV0.5 HT) da storico recente (ultime LOOKBACK gare) delle squadre,
-conteggiando i match con almeno 1 gol nel 1° tempo. Filtra con PTHRESH e MIN_PLAYED.
+Requisiti: fastapi, uvicorn[standard], requests
+Procfile:  web: uvicorn app_combo:app --host 0.0.0.0 --port $PORT
 """
 
 import os
@@ -21,21 +22,22 @@ import requests
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-# ------------- ENV -------------
+# =============== ENV ===============
 API_HOST = "https://v3.football.api-sports.io"
 API_KEY  = os.getenv("API_FOOTBALL_KEY", "").strip()
 HEADERS  = {"x-apisports-key": API_KEY}
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+STARTUP_ALERT = int(os.getenv("STARTUP_ALERT", "1") or 1)
 
-# Picker
-PTHRESH       = float(os.getenv("PTHRESH", "0.72") or 0.72)
-MIN_PLAYED    = int(os.getenv("MIN_PLAYED", "6") or 6)
-LOOKBACK      = int(os.getenv("LOOKBACK", "8") or 8)      # quante gare recenti per stimare p
-PAST_WINDOW_D = int(os.getenv("PAST_WINDOW_D", "90") or 90)  # fino a N gg indietro per trovare gare recenti
-PICKER_EVERY_S= int(os.getenv("PICKER_EVERY_S", "900") or 900) # ogni 15'
-LEAGUES       = os.getenv("LEAGUES", "").strip()  # es "39,78,135" (vuoto = tutte)
+# Picker (criteri simili al tuo “strict” semplificato)
+PTHRESH        = float(os.getenv("PTHRESH", "0.72") or 0.72)
+MIN_PLAYED     = int(os.getenv("MIN_PLAYED", "6") or 6)
+LOOKBACK       = int(os.getenv("LOOKBACK", "8") or 8)              # quante gare recenti per stimare p
+PAST_WINDOW_D  = int(os.getenv("PAST_WINDOW_D", "90") or 90)       # fino a N gg indietro per trovare gare
+PICKER_EVERY_S = int(os.getenv("PICKER_EVERY_S", "900") or 900)    # ogni 15'
+LEAGUES        = os.getenv("LEAGUES", "").strip()                  # es "39,78,135" (vuoto = tutte)
 
 # Monitor
 THRESHOLD    = float(os.getenv("THRESHOLD", "1.50") or 1.50)
@@ -44,15 +46,18 @@ MINUTE_MIN   = int(os.getenv("MINUTE_MIN", "1") or 1)
 MINUTE_MAX   = int(os.getenv("MINUTE_MAX", "45") or 45)
 
 # Kelly / bankroll
-KELLY_SCALE    = float(os.getenv("KELLY_SCALE", "0.5") or 0.5)  # frazione di Kelly
+KELLY_SCALE    = float(os.getenv("KELLY_SCALE", "0.5") or 0.5)     # frazione di Kelly
 BANKROLL_FILE  = os.getenv("BANKROLL_FILE", "/app/bankroll.json")
 BANKROLL_START = float(os.getenv("BANKROLL_START", "100.0") or 100.0)
 MAX_STAKE_PCT  = float(os.getenv("MAX_STAKE_PCT", "0.05") or 0.05)
 MIN_STAKE      = float(os.getenv("MIN_STAKE", "1.0") or 1.0)
 
-DEBUG = int(os.getenv("DEBUG", "0") or 0)
+# Diagnostica extra
+DEBUG          = int(os.getenv("DEBUG", "0") or 0)
+BYPASS_WHITELIST = int(os.getenv("BYPASS_WHITELIST", "0") or 0)  # 1=ignora whitelist (TEST)
+DEBUG_ODDS       = int(os.getenv("DEBUG_ODDS", "0") or 0)        # 1=log mercati visti se non matcha
 
-# ---------------- STATE ----------------
+# =============== STATE & APP ===============
 app = FastAPI()
 WL_LOCK = threading.Lock()
 WHITELIST = set()                # fixture_id candidati oggi
@@ -68,7 +73,7 @@ def log(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
-# ---------------- COMMON API-Football helpers ----------------
+# =============== Helpers comuni ===============
 def _api(path: str, params: dict):
     r = requests.get(f"{API_HOST}{path}", headers=HEADERS, params=params, timeout=30)
     r.raise_for_status()
@@ -87,7 +92,7 @@ def tg_send(text: str):
     except Exception as e:
         log(f"[TG] error: {e}")
 
-# ---------------- Bankroll / Kelly ----------------
+# =============== Bankroll / Kelly ===============
 def load_bankroll():
     try:
         with open(BANKROLL_FILE, "r", encoding="utf-8") as f:
@@ -119,7 +124,7 @@ def suggest_stake(bankroll, p_est, odds):
         return 0.0
     return round(stake, 2)
 
-# ---------------- Odds (HT Over 0.5) ----------------
+# =============== Odds (HT Over 0.5) ===============
 HT_MARKETS = {
     "1st Half - Over/Under",
     "Over/Under 1st Half",
@@ -140,7 +145,8 @@ def fetch_odds_any(fixture_id):
     try:
         live = _api("/odds/live", {"fixture": fixture_id})
         if live: return live
-    except: pass
+    except:
+        pass
     try:
         pre = _api("/odds", {"fixture": fixture_id})
         return pre
@@ -148,24 +154,32 @@ def fetch_odds_any(fixture_id):
         return []
 
 def pick_ht_over05(odds_resp):
+    """Ritorna (best_price, best_book). Se non trova, logga (se DEBUG_ODDS)."""
     best, book = None, None
+    seen = set()
     for it in odds_resp or []:
         for bk in it.get("bookmakers", []):
             bname = bk.get("name", "")
             for bet in bk.get("bets", []):
                 mk = (bet.get("name") or "").strip()
-                if mk not in HT_MARKETS: continue
+                seen.add(mk)
+                if mk not in HT_MARKETS:
+                    continue
                 for v in bet.get("values", []):
                     val = (v.get("value") or "").strip()
-                    if not any(val.startswith(x) for x in HT_VALUES): continue
+                    if not any(val.startswith(x) for x in HT_VALUES):
+                        continue
                     try:
                         price = float(v.get("odd"))
-                    except: continue
+                    except:
+                        continue
                     if (best is None) or (price > best):
                         best, book = price, bname
+    if DEBUG_ODDS and best is None:
+        log("[NO-ODDS] mercati visti: " + ", ".join(sorted(seen)))
     return best, book
 
-# ---------------- Picker (strict semplificato) ----------------
+# =============== Picker (strict semplificato) ===============
 def fixtures_by_date_day(iso, leagues=None):
     params = {"date": iso}
     if leagues:
@@ -189,7 +203,6 @@ def count_ht_over05(fixtures):
         try:
             events = _api("/fixtures/events", {"fixture": fid})
             n += 1
-            # “Goal” nel 1° tempo
             has = False
             for ev in events:
                 if ev.get("type") == "Goal":
@@ -198,7 +211,8 @@ def count_ht_over05(fixtures):
                     if m <= 45:
                         has = True
                         break
-            if has: c += 1
+            if has:
+                c += 1
         except:
             pass
     return c, n
@@ -234,7 +248,7 @@ def picker_build_whitelist():
         pA, nA = estimate_p_from_history(away_id)
         if pH is None or pA is None:
             continue
-        # media semplice (puoi pesare home/away diversamente se vuoi)
+        # media semplice (puoi pesare home/away diversamente)
         p = (pH + pA) / 2.0
         if p >= PTHRESH:
             wl.add(fid)
@@ -262,13 +276,14 @@ def picker_loop():
             if DEBUG: traceback.print_exc()
         time.sleep(PICKER_EVERY_S)
 
-# ---------------- Monitor live (usa SOLO whitelist) ----------------
+# =============== Monitor live (usa SOLO whitelist) ===============
 def get_live_1H():
     resp = _api("/fixtures", {"live": "all"})
     out = []
     for it in resp:
         st = it.get("fixture", {}).get("status", {}) or {}
-        if st.get("short") != "1H": continue
+        if st.get("short") != "1H":
+            continue
         elapsed = int(st.get("elapsed") or 0)
         if MINUTE_MIN <= elapsed <= MINUTE_MAX:
             out.append(it)
@@ -281,7 +296,7 @@ def monitor_loop():
 
     notified = set()
 
-    log(f"[MONITOR] start THRESH={THRESHOLD} Kelly={KELLY_SCALE}")
+    log(f"[MONITOR] start THRESH={THRESHOLD} Kelly={KELLY_SCALE} BYPASS_WL={BYPASS_WHITELIST}")
 
     while True:
         try:
@@ -291,8 +306,13 @@ def monitor_loop():
 
             for it in lives:
                 fid = int(it.get("fixture", {}).get("id"))
-                if wl and (fid not in wl):
-                    continue   # FUORI METODO
+                # ---- BYPASS whitelist per test diagnostici ----
+                use_wl = set(wl)
+                if BYPASS_WHITELIST:
+                    use_wl = set()  # “vuoto” = non filtro (osservo tutte)
+                if use_wl and (fid not in use_wl):
+                    continue
+                # ------------------------------------------------
 
                 st = it.get("fixture", {}).get("status", {}) or {}
                 m  = int(st.get("elapsed") or 0)
@@ -327,7 +347,7 @@ def monitor_loop():
                     stake = suggest_stake(bankroll, p_est, price)
 
                     lines = [
-                        f"▶️ OV 0.5 HT @ {price:.2f} ({book})",
+                        f"🚨 OV 0.5 HT @ {price:.2f} ({book})",
                         f"{home} — {away}",
                         f"{lname} | min {m}",
                         f"p≈{p_est:.2f}  bankroll={bankroll:.2f}",
@@ -338,7 +358,7 @@ def monitor_loop():
                             "ts": int(time.time()), "stake": stake, "odds": price, "p": p_est,
                             "home": home, "away": away, "league": lname
                         }
-                        data["bankroll"] = bankroll  # (bankroll si aggiorna quando registri un risultato)
+                        data["bankroll"] = bankroll  # aggiornerai a esito registrato
                         save_bankroll(data)
                         STATE["bankroll"] = data["bankroll"]
                         STATE["pending"]  = data["pending"]
@@ -362,7 +382,7 @@ def monitor_loop():
             if DEBUG: traceback.print_exc()
             time.sleep(3)
 
-# ---------------- FastAPI (web) ----------------
+# =============== FastAPI (web + diagnostica) ===============
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.utcnow().isoformat()+"Z"}
@@ -387,8 +407,43 @@ def status():
         "wl_last_build": last_build
     })
 
-# ---------------- Bootstrap ----------------
+@app.get("/selftest")
+def selftest(msg: str = "🔔 Test alert da Railway (selftest)"):
+    try:
+        tg_send(msg)
+        return {"ok": True, "sent": True, "msg": msg}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+@app.get("/probe_odds")
+def probe_odds(fixture: int):
+    try:
+        resp = fetch_odds_any(fixture)
+        # estrai elenco mercati trovati
+        mk = set()
+        for it in resp or []:
+            for bk in it.get("bookmakers", []):
+                for bet in bk.get("bets", []):
+                    mk.add((bet.get("name") or "").strip())
+        price, book = pick_ht_over05(resp)
+        return {
+            "fixture": fixture,
+            "markets_seen": sorted(mk),
+            "matched_price": price,
+            "bookmaker": book
+        }
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+# =============== Bootstrap ===============
 def _boot():
+    # alert di startup (se abilitato)
+    if STARTUP_ALERT and BOT_TOKEN and CHAT_ID:
+        try:
+            tg_send("🚀 Script avviato – in ascolto (OV 0.5 HT ≥ %.2f)" % THRESHOLD)
+        except Exception as e:
+            log(f"[TG] startup alert error: {e}")
+
     # carica bankroll su STATE
     data = load_bankroll()
     STATE["bankroll"] = data.get("bankroll", BANKROLL_START)
@@ -397,6 +452,6 @@ def _boot():
     # thread picker + monitor
     threading.Thread(target=picker_loop, daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
-    log("[BOOT] picker+monitor avviati")
+    log(f"[BOOT] picker+monitor avviati (DEBUG={DEBUG} BYPASS_WL={BYPASS_WHITELIST} DEBUG_ODDS={DEBUG_ODDS})")
 
 _boot()
